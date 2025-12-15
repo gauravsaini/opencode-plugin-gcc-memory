@@ -1,0 +1,20 @@
+{
+  "name": "@knikolov/opencode-plugin-simple-memory",
+  "module": "index.ts",
+  "version": "1.0.0",
+  "author": "knikolov",
+  "repository": "https://github.com/cnicolov/opencode-plugin-simple-memory",
+  "files": [
+    "index.ts",
+    "src"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.0.153",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

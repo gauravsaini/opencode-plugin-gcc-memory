@@ -31,7 +31,7 @@ const parseLine = (line: string): Memory | null => {
   const issueMatch = line.match(/issue=([^\s]+)/)
   const tagsMatch = line.match(/tags=([^\s]+)/)
 
-  if (!tsMatch || !typeMatch || !scopeMatch) return null
+  if (!tsMatch?.[1] || !typeMatch?.[1] || !scopeMatch?.[1]) return null
 
   return {
     ts: tsMatch[1],
@@ -213,7 +213,7 @@ const update = tool({
     }
 
     // If multiple matches and query provided, filter by query
-    let target = matches[0]
+    let target: typeof matches[number] | undefined = matches[0]
     if (matches.length > 1) {
       if (args.query) {
         const words = args.query.toLowerCase().split(/\s+/).filter(Boolean)
@@ -229,6 +229,10 @@ const update = tool({
       } else {
         return `Found ${matches.length} memories for ${args.type}/${args.scope}. Provide a query to select which one to update, or use recall to see all matches.`
       }
+    }
+
+    if (!target) {
+      return `No memories found for ${args.type} in ${args.scope}`
     }
 
     // Log the old version before updating
@@ -340,7 +344,7 @@ const forget = tool({
   },
 })
 
-export const MemoryPlugin: Plugin = async (ctx) => {
+export const MemoryPlugin: Plugin = async (_ctx) => {
   return {
     tool: {
       memory_remember: remember,
@@ -351,3 +355,5 @@ export const MemoryPlugin: Plugin = async (ctx) => {
     },
   }
 }
+
+export default MemoryPlugin
