@@ -1,28 +1,35 @@
-# OpenCode Simple Memory Plugin
-
-[![npm version](https://img.shields.io/npm/v/@knikolov/opencode-plugin-simple-memory.svg)](https://www.npmjs.com/package/@knikolov/opencode-plugin-simple-memory)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+# Simple Memory Plugin for OpenCode
 
 A persistent memory plugin for [OpenCode](https://opencode.ai) that enables the AI assistant to remember context across sessions.
 
-## Features
+## Setup
 
-- **Persistent Storage**: Memories stored in logfmt format, organized by date
-- **Memory Types**: Support for decisions, learnings, preferences, blockers, context, and patterns
-- **Scoped Organization**: Organize memories by scope (e.g., user, project, api, auth)
-- **Search & Filtering**: Query memories by scope, type, or free-text search
-- **Audit Trail**: Deletions are logged for accountability
+1. Add the plugin to your [OpenCode config](https://opencode.ai/docs/config/):
 
-## Installation
+   ```json
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "plugin": ["@knikolov/opencode-plugin-simple-memory"]
+   }
+   ```
 
-Add to your `~/.config/opencode/opencode.json`:
+2. Start using memory commands in your conversations.
 
-```json
-{
-  "plugin": [
-    "@knikolov/opencode-plugin-simple-memory"
-  ]
-}
+Memories are stored in `.opencode/memory/` as daily logfmt files.
+
+## Updating
+
+> [!WARNING]
+> OpenCode does NOT auto-update plugins.
+
+To get the latest version, clear the cached plugin and let OpenCode reinstall it:
+
+```bash
+# Remove the plugin from cache
+rm -rf ~/.cache/opencode/node_modules/@knikolov/opencode-plugin-simple-memory
+
+# Run OpenCode to trigger reinstall
+opencode
 ```
 
 ## Tools
@@ -46,81 +53,63 @@ The plugin provides five tools:
 - `context` - General context information
 - `pattern` - Recurring patterns or conventions
 
-## Storage
-
-Memories are stored in `.opencode/memory/` as daily logfmt files:
+## Example Usage
 
 ```
-.opencode/memory/
-  2025-12-15.logfmt
-  deletions.logfmt    # audit log
-```
+User: Remember that my name is Kris
 
-## Example Chat
-
-```
-User: What do you know about me?
-
-AI: I don't have any stored information about you yet. Let me check if there are 
-    any memories saved in the system.
+AI: [calls memory_remember with type="context", scope="user", 
+     content="User's name is Kris"]
     
-    [calls memory_list]
-    
-    Total memories: 2
-    Scopes:
-      user: 2 (context)
-    Types:
-      context: 2
-    
-    [calls memory_recall with scope="user"]
-    
-    Found 2 memories:
-    [2025-12-15] context/user: User's name is Kris
-    [2025-12-15] context/user: Passionate about Software Engineering
-    
-    Based on the stored memories, here's what I know about you:
-    1. Name: Kris
-    2. Interest: You're passionate about Software Engineering
+    I've stored that your name is Kris.
 
 User: My preferred programming language is Erlang
 
 AI: [calls memory_remember with type="preference", scope="user", 
      content="Preferred programming language is Erlang"]
     
-    Got it, Kris. I've stored that your preferred programming language is Erlang.
-    A solid choice for concurrent, fault-tolerant systems!
+    Got it! I've noted that your preferred programming language is Erlang.
 
-User: What do you know about me now?
+User: What do you know about me?
 
 AI: [calls memory_recall with scope="user"]
     
-    Found 3 memories:
-    [2025-12-15] context/user: User's name is Kris
-    [2025-12-15] context/user: Passionate about Software Engineering
-    [2025-12-15] preference/user: Preferred programming language is Erlang
-    
-    Here's everything I know about you:
-    1. Name: Kris
-    2. Passionate about Software Engineering
-    3. Preferred programming language: Erlang
+    Here's what I know about you:
+    - Your name is Kris
+    - Your preferred programming language is Erlang
 
-User: Actually, I changed my mind. I prefer Elixir now.
+User: Actually, I prefer Elixir now.
 
 AI: [calls memory_update with type="preference", scope="user", 
      content="Preferred programming language is Elixir"]
     
-    Updated! Your language preference is now set to Elixir. Makes sense - you 
-    get the Erlang VM benefits with a more modern syntax.
+    Updated your language preference to Elixir.
 
-User: Forget my language preference entirely
+User: Forget my language preference
 
 AI: [calls memory_forget with type="preference", scope="user", 
-     reason="User requested removal of language preference"]
+     reason="User requested removal"]
     
-    Done. I've removed your language preference from memory. The deletion has 
-    been logged for audit purposes.
+    Done. I've removed your language preference from memory.
 ```
 
-## License
+## Local Development
 
-MIT
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/cnicolov/opencode-plugin-simple-memory.git
+cd opencode-plugin-simple-memory
+bun install
+```
+
+Point your OpenCode config to the local checkout via a `file://` URL:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file:///absolute/path/to/opencode-plugin-simple-memory"]
+}
+```
+
+Replace `/absolute/path/to/opencode-plugin-simple-memory` with your actual path.
