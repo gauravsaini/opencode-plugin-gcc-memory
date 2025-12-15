@@ -12,15 +12,15 @@ A persistent memory plugin for [OpenCode](https://opencode.ai) that enables the 
 
 ## Installation
 
-1. Copy the plugin to your OpenCode plugins directory:
-   ```
-   .opencode/plugin/memory.ts
-   ```
+Add to your `~/.config/opencode/opencode.json`:
 
-2. Install dependencies:
-   ```bash
-   cd .opencode && bun install
-   ```
+```json
+{
+  "plugin": [
+    "@cnicolov/opencode-plugin-simple-memory"
+  ]
+}
+```
 
 ## Tools
 
