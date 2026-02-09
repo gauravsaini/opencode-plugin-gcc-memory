@@ -1,17 +1,86 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
 const MEMORY_DIR = ".opencode/memory"
+const GCC_DIR = ".opencode/memory/.GCC"
+const CURRENT_BRANCH_FILE = ".opencode/memory/.GCC/current_branch"
 
-const getMemoryFile = () => {
-  const date = new Date().toISOString().split("T")[0]
-  return Bun.file(`${MEMORY_DIR}/${date}.logfmt`)
-}
+// GCC System Prompt - injected into agent context (Paper Section 2.2)
+const GCC_SYSTEM_PROMPT = `
+<gcc_context>
+You have access to Git-Context-Controller (GCC) for managing your reasoning memory.
+GCC transforms your context from a passive token stream into a navigable, versioned memory hierarchy.
+
+## Available Commands
+
+### COMMIT (memory_commit)
+Call when you reach a meaningful milestone (implementing a function, completing a test, resolving a subgoal).
+Args: message (summary), contribution (detailed description), update_roadmap (optional boolean)
+
+### BRANCH (memory_branch)  
+Call when you want to explore an alternative approach without affecting current context.
+Args: name (branch name), purpose (why this branch)
+
+### MERGE (memory_merge)
+Call when a completed branch's results should be synthesized back into main.
+Args: branch (branch to merge), summary (outcome and integration summary)
+
+### CONTEXT (memory_context)
+Call to retrieve project history, branch summaries, or execution logs.
+Levels:
+- roadmap: Project overview + branch list
+- branch: Branch purpose + last 10 commits
+- commits: Full commit history for a branch
+- log: Fine-grained OTA traces (with optional lines param)
+- metadata: Structured branch metadata
+
+### LOG (memory_log)
+Call to record Observation-Thought-Action steps for fine-grained tracing.
+Args: observation, thought, action (structured) OR entry (freeform)
+
+### SWITCH (memory_switch)
+Call to switch to a different branch.
+Args: branch (branch name to switch to)
+
+## When to Use
+
+- **COMMIT**: After implementing a feature, fixing a bug, or reaching a conclusion
+- **BRANCH**: When exploring alternative approaches (e.g., new API design, different algorithm)
+- **MERGE**: When a branch experiment succeeds and should be integrated
+- **CONTEXT**: When resuming work, before MERGE, or when needing historical info
+- **LOG**: During reasoning to record fine-grained steps between commits
+
+## Current State
+Current Branch: {{CURRENT_BRANCH}}
+{{#if ROADMAP_SUMMARY}}
+Project Roadmap Summary:
+{{ROADMAP_SUMMARY}}
+{{/if}}
+</gcc_context>
+`
+
+// GCC-inspired: File paths
+const getMainFile = () => Bun.file(`${GCC_DIR}/main.md`)
+const getBranchDir = (branch: string) => `${GCC_DIR}/branches/${branch}`
+const getCommitFile = (branch: string) => Bun.file(`${getBranchDir(branch)}/commit.md`)
+const getLogFile = (branch: string) => Bun.file(`${getBranchDir(branch)}/log.md`)
+const getMetadataFile = (branch: string) => Bun.file(`${getBranchDir(branch)}/metadata.yaml`)
 
 const ensureDir = async () => {
-  const dir = Bun.file(MEMORY_DIR)
-  if (!(await dir.exists())) {
-    await Bun.$`mkdir -p ${MEMORY_DIR}`
+  await Bun.$`mkdir -p ${MEMORY_DIR}`
+  await Bun.$`mkdir -p ${GCC_DIR}`
+  await Bun.$`mkdir -p ${GCC_DIR}/branches`
+}
+
+const getCurrentBranch = async (): Promise<string> => {
+  const file = Bun.file(CURRENT_BRANCH_FILE)
+  if (await file.exists()) {
+    return (await file.text()).trim()
   }
+  return "main"
+}
+
+const setCurrentBranch = async (branch: string) => {
+  await Bun.write(CURRENT_BRANCH_FILE, branch)
 }
 
 interface Memory {
@@ -23,46 +92,380 @@ interface Memory {
   tags?: string[]
 }
 
-const parseLine = (line: string): Memory | null => {
-  const tsMatch = line.match(/ts=([^\s]+)/)
-  const typeMatch = line.match(/type=([^\s]+)/)
-  const scopeMatch = line.match(/scope=([^\s]+)/)
-  const contentMatch = line.match(/content="([^"]*(?:\\"[^"]*)*)"/)
-  const issueMatch = line.match(/issue=([^\s]+)/)
-  const tagsMatch = line.match(/tags=([^\s]+)/)
-
-  if (!tsMatch?.[1] || !typeMatch?.[1] || !scopeMatch?.[1]) return null
-
-  return {
-    ts: tsMatch[1],
-    type: typeMatch[1],
-    scope: scopeMatch[1],
-    content: contentMatch?.[1]?.replace(/\\"/g, '"') || "",
-    issue: issueMatch?.[1],
-    tags: tagsMatch?.[1]?.split(","),
-  }
+interface CommitEntry {
+  hash: string
+  timestamp: string
+  message: string
+  branch_purpose?: string
+  previous_summary?: string
+  contribution: string
 }
 
-const formatMemory = (m: Memory): string => {
-  const date = m.ts.split("T")[0]
-  const tags = m.tags?.length ? ` [${m.tags.join(", ")}]` : ""
-  const issue = m.issue ? ` (${m.issue})` : ""
-  return `[${date}] ${m.type}/${m.scope}: ${m.content}${issue}${tags}`
-}
+// GCC Tool 1: COMMIT - Checkpoint meaningful progress
+const commit = tool({
+  description: "GCC COMMIT: Checkpoint meaningful progress as a coherent milestone (like Git commit)",
+  args: {
+    message: tool.schema.string().describe("Commit message summarizing the milestone"),
+    contribution: tool.schema.string().describe("Detailed description of what was achieved"),
+    update_roadmap: tool.schema.boolean().optional().describe("Update main.md roadmap? (default: false)"),
+  },
+  async execute(args) {
+    await ensureDir()
+    const branch = await getCurrentBranch()
+    const branchDir = getBranchDir(branch)
+    await Bun.$`mkdir -p ${branchDir}`
 
-const scoreMatch = (memory: Memory, words: string[]): number => {
-  const searchable = `${memory.type} ${memory.scope} ${memory.content} ${memory.tags?.join(" ") || ""}`.toLowerCase()
-  let score = 0
-  for (const word of words) {
-    if (searchable.includes(word)) score++
-    if (memory.scope.toLowerCase() === word) score += 2
-    if (memory.type.toLowerCase() === word) score += 2
-  }
-  return score
-}
+    const commitFile = getCommitFile(branch)
+    const logFile = getLogFile(branch)
 
+    // Generate commit hash
+    const hash = Date.now().toString(36)
+    const timestamp = new Date().toISOString()
+
+    // Read previous summary and branch purpose (Paper Section 2.1)
+    // commit.md structure: Branch Purpose + Previous Progress Summary + This Commit's Contribution
+    let previousSummary = ""
+    let branchPurpose = branch === "main" ? "Main development branch" : `Branch: ${branch}`
+    
+    if (await commitFile.exists()) {
+      const content = await commitFile.text()
+      
+      // Extract branch purpose from first commit (inherited)
+      const purposeMatch = content.match(/## Branch Purpose\n([\s\S]*?)(?=\n## |$)/)
+      if (purposeMatch?.[1]?.trim()) {
+        branchPurpose = purposeMatch[1].trim()
+      }
+      
+      // Get the LAST commit's "Previous Progress Summary" + "This Commit's Contribution"
+      // to form the NEW Previous Progress Summary (cumulative)
+      const allCommits = content.split(/---\n\*\*Commit\*\*:/).filter(Boolean)
+      if (allCommits.length > 0) {
+        const lastCommit = allCommits[allCommits.length - 1] || ""
+        const prevSummaryMatch = lastCommit.match(/## Previous Progress Summary\n([\s\S]*?)(?=\n## This Commit)/)
+        const contributionMatch = lastCommit.match(/## This Commit's Contribution\n([\s\S]*?)(?=\n---|\n$|$)/)
+        
+        const prevPart = prevSummaryMatch?.[1]?.trim() || ""
+        const contribPart = contributionMatch?.[1]?.trim() || ""
+        
+        // Combine: Previous + Last Contribution = New Previous
+        if (prevPart && contribPart) {
+          previousSummary = `${prevPart}\n- ${contribPart}`
+        } else if (contribPart) {
+          previousSummary = `- ${contribPart}`
+        } else if (prevPart) {
+          previousSummary = prevPart
+        }
+      }
+    }
+
+    // Append to commit.md (Paper structure: 3 blocks)
+    const commitEntry = `
+---
+**Commit**: ${hash}
+**Time**: ${timestamp}
+**Message**: ${args.message}
+
+## Branch Purpose
+${branchPurpose}
+
+## Previous Progress Summary
+${previousSummary || "Initial commit"}
+
+## This Commit's Contribution
+${args.contribution}
+
+`
+
+    const existing = (await commitFile.exists()) ? await commitFile.text() : ""
+    await Bun.write(commitFile, existing + commitEntry)
+
+    // Clear log.md after commit (it's been summarized)
+    await Bun.write(logFile, "")
+
+    // Optionally update main.md
+    if (args.update_roadmap) {
+      const mainFile = getMainFile()
+      const mainContent = (await mainFile.exists()) ? await mainFile.text() : "# Project Roadmap\n\n"
+      await Bun.write(mainFile, mainContent + `\n- [${timestamp.split("T")[0]}] ${args.message}\n`)
+    }
+
+    return `✓ Committed [${hash}] on branch '${branch}': ${args.message}`
+  },
+})
+
+// GCC Tool 2: BRANCH - Explore alternatives in isolation
+const branch = tool({
+  description: "GCC BRANCH: Create a new branch to explore alternative approach without affecting main plan",
+  args: {
+    name: tool.schema.string().describe("Branch name (e.g., 'oauth-experiment')"),
+    purpose: tool.schema.string().describe("Why this branch? What are you exploring?"),
+  },
+  async execute(args) {
+    await ensureDir()
+    const branchDir = getBranchDir(args.name)
+    await Bun.$`mkdir -p ${branchDir}`
+
+    // Initialize commit.md with branch purpose
+    const commitFile = getCommitFile(args.name)
+    const initCommit = `# Branch: ${args.name}
+
+## Branch Purpose
+${args.purpose}
+
+## Previous Progress Summary
+Branch created at ${new Date().toISOString()}
+
+---
+`
+    await Bun.write(commitFile, initCommit)
+
+    // Initialize empty log.md
+    await Bun.write(getLogFile(args.name), "")
+
+    // Initialize metadata.yaml
+    await Bun.write(getMetadataFile(args.name), `branch: ${args.name}\ncreated: ${new Date().toISOString()}\n`)
+
+    // Switch to new branch
+    await setCurrentBranch(args.name)
+
+    return `✓ Created and switched to branch '${args.name}'\nPurpose: ${args.purpose}`
+  },
+})
+
+// GCC Tool 3: MERGE - Integrate successful branch into main (Paper Section 2.2)
+const merge = tool({
+  description: "GCC MERGE: Merge a completed branch back into main (or current branch). Auto-retrieves target branch context before merging.",
+  args: {
+    branch: tool.schema.string().describe("Branch to merge"),
+    summary: tool.schema.string().describe("Summary of branch outcome and integration"),
+  },
+  async execute(args) {
+    await ensureDir()
+    const currentBranch = await getCurrentBranch()
+    const targetBranch = args.branch
+
+    // Read target branch commit.md
+    const targetCommitFile = getCommitFile(targetBranch)
+    if (!(await targetCommitFile.exists())) {
+      return `✗ Branch '${targetBranch}' not found`
+    }
+
+    const targetCommits = await targetCommitFile.text()
+    const targetLogFile = getLogFile(targetBranch)
+    const targetLog = (await targetLogFile.exists()) ? await targetLogFile.text() : ""
+
+    // Paper requirement: Auto-CONTEXT on target branch before merge
+    // Extract branch purpose and progress summary for context
+    const purposeMatch = targetCommits.match(/## Branch Purpose\n([\s\S]*?)(?=\n## |$)/)
+    const targetPurpose = purposeMatch?.[1]?.trim() || "No purpose defined"
+    
+    // Get last commit's contribution as summary
+    const allCommits = targetCommits.split(/---\n\*\*Commit\*\*:/).filter(Boolean)
+    let targetProgressSummary = ""
+    if (allCommits.length > 0) {
+      const lastCommit = allCommits[allCommits.length - 1] || ""
+      const prevMatch = lastCommit.match(/## Previous Progress Summary\n([\s\S]*?)(?=\n## This Commit)/)
+      const contribMatch = lastCommit.match(/## This Commit's Contribution\n([\s\S]*?)(?=\n---|\n$|$)/)
+      targetProgressSummary = (prevMatch?.[1]?.trim() || "") + "\n- " + (contribMatch?.[1]?.trim() || "")
+    }
+
+    // Merge into current branch
+    const currentCommitFile = getCommitFile(currentBranch)
+    const currentLogFile = getLogFile(currentBranch)
+    await Bun.$`mkdir -p ${getBranchDir(currentBranch)}`
+
+    // Paper: Merge commit.md entries with unified structure
+    const mergeEntry = `
+---
+**MERGE**: ${targetBranch} → ${currentBranch}
+**Time**: ${new Date().toISOString()}
+
+## Merge Summary
+${args.summary}
+
+## Merged Branch Context (Auto-Retrieved)
+**Purpose**: ${targetPurpose}
+**Progress**: ${targetProgressSummary}
+
+## Merged Commits from '${targetBranch}'
+${targetCommits}
+
+---
+`
+
+    const existingCommits = (await currentCommitFile.exists()) ? await currentCommitFile.text() : ""
+    await Bun.write(currentCommitFile, existingCommits + mergeEntry)
+
+    // Paper: Merge log.md files with origin tags
+    const existingLog = (await currentLogFile.exists()) ? await currentLogFile.text() : ""
+    const mergedLog = `${existingLog}\n\n== Merged from Branch: ${targetBranch} ==\n${targetLog}\n`
+    await Bun.write(currentLogFile, mergedLog)
+
+    // Update main.md with merge outcome
+    const mainFile = getMainFile()
+    const mainContent = (await mainFile.exists()) ? await mainFile.text() : "# Project Roadmap\n\n"
+    await Bun.write(mainFile, mainContent + `\n- [MERGE] ${targetBranch} → ${currentBranch}: ${args.summary}\n`)
+
+    return `✓ Merged '${targetBranch}' into '${currentBranch}'\n\n## Target Branch Context (Auto-Retrieved)\nPurpose: ${targetPurpose}\nProgress: ${targetProgressSummary.slice(0, 200)}...\n\n${args.summary}`
+  },
+})
+
+// GCC Tool 4: CONTEXT - Multi-level memory retrieval (Paper Section 2.2)
+const context = tool({
+  description: "GCC CONTEXT: Retrieve memory at multiple levels (roadmap, branch, commits, commit, log, metadata)",
+  args: {
+    level: tool.schema
+      .enum(["roadmap", "branch", "commits", "commit", "log", "metadata"])
+      .optional()
+      .describe("Level of detail (default: roadmap)"),
+    branch_name: tool.schema.string().optional().describe("Specific branch to inspect"),
+    commit_hash: tool.schema.string().optional().describe("Specific commit hash to view (for level='commit')"),
+    lines: tool.schema.number().optional().describe("Number of log lines to show (default: 20)"),
+    offset: tool.schema.number().optional().describe("Offset for scrolling logs (default: 0)"),
+  },
+  async execute(args) {
+    await ensureDir()
+    const currentBranch = await getCurrentBranch()
+    const level = args.level || "roadmap"
+
+    if (level === "roadmap") {
+      // Git status-style snapshot (Paper: project purpose, milestone progress, branch list)
+      const mainFile = getMainFile()
+      const roadmap = (await mainFile.exists()) ? await mainFile.text() : "# Project Roadmap\n\nNo roadmap yet."
+
+      const branchesGlob = new Bun.Glob("*")
+      const branches = await Array.fromAsync(branchesGlob.scan(`${GCC_DIR}/branches`))
+
+      return `${roadmap}\n\n## Available Branches\nCurrent: ${currentBranch}\nAll: ${branches.join(", ") || "main"}`
+    }
+
+    if (level === "branch") {
+      // Branch purpose + progress summary + last 10 commits (Paper spec)
+      const branch = args.branch_name || currentBranch
+      const commitFile = getCommitFile(branch)
+      if (!(await commitFile.exists())) {
+        return `✗ Branch '${branch}' not found`
+      }
+
+      const commits = await commitFile.text()
+      
+      // Extract branch purpose
+      const purposeMatch = commits.match(/## Branch Purpose\n([\s\S]*?)(?=\n## |$)/)
+      const purpose = purposeMatch?.[1]?.trim() || "No purpose defined"
+      
+      // Extract last 10 commit hashes and messages
+      const commitMatches = [...commits.matchAll(/\*\*Commit\*\*: (\w+)[\s\S]*?\*\*Message\*\*: ([^\n]+)/g)]
+      const lastTen = commitMatches.slice(-10).map(m => `- ${m[1]}: ${m[2]}`).join("\n")
+
+      return `# Branch: ${branch}\n\n## Purpose\n${purpose}\n\n## Last 10 Commits\n${lastTen || "No commits yet"}`
+    }
+
+    if (level === "commits") {
+      // Full commit history
+      const branch = args.branch_name || currentBranch
+      const commitFile = getCommitFile(branch)
+      if (!(await commitFile.exists())) {
+        return `✗ Branch '${branch}' not found`
+      }
+      return await commitFile.text()
+    }
+
+    if (level === "commit") {
+      // Specific commit by hash (Paper: CONTEXT --commit <hash>)
+      const branch = args.branch_name || currentBranch
+      const commitFile = getCommitFile(branch)
+      if (!(await commitFile.exists())) {
+        return `✗ Branch '${branch}' not found`
+      }
+      
+      if (!args.commit_hash) {
+        return `✗ commit_hash required for level='commit'`
+      }
+      
+      const commits = await commitFile.text()
+      const commitBlocks = commits.split(/(?=---\n\*\*Commit\*\*:)/).filter(Boolean)
+      
+      const matchedCommit = commitBlocks.find(block => block.includes(`**Commit**: ${args.commit_hash}`))
+      
+      if (!matchedCommit) {
+        return `✗ Commit '${args.commit_hash}' not found in branch '${branch}'`
+      }
+      
+      return matchedCommit.trim()
+    }
+
+    if (level === "log") {
+      // Fine-grained OTA traces with scrolling (Paper: last 20 lines, scroll up/down)
+      const branch = args.branch_name || currentBranch
+      const logFile = getLogFile(branch)
+      if (!(await logFile.exists())) {
+        return `✗ No logs for branch '${branch}'`
+      }
+      const log = await logFile.text()
+      const logLines = log.split("\n")
+      const numLines = args.lines || 20
+      const offset = args.offset || 0
+      
+      const start = Math.max(0, logLines.length - numLines - offset)
+      const end = logLines.length - offset
+      
+      const shownLines = logLines.slice(start, end)
+      const hasMore = start > 0
+      const hasLess = offset > 0
+      
+      return `# Log for branch: ${branch}\n(Showing lines ${start + 1}-${end} of ${logLines.length})\n${hasMore ? "[scroll up: use offset=" + (offset + numLines) + "]" : ""}\n${hasLess ? "[scroll down: use offset=" + Math.max(0, offset - numLines) + "]" : ""}\n\n${shownLines.join("\n")}`
+    }
+
+    if (level === "metadata") {
+      // Structured metadata segment (Paper: file structure, env config, etc.)
+      const branch = args.branch_name || currentBranch
+      const metadataFile = getMetadataFile(branch)
+      if (!(await metadataFile.exists())) {
+        return `✗ No metadata for branch '${branch}'`
+      }
+      return await metadataFile.text()
+    }
+
+    return "Invalid level. Use: roadmap, branch, commits, commit, log, or metadata"
+  },
+})
+
+// GCC Tool 5: LOG - Append to log.md (OTA trace)
+const log = tool({
+  description: "GCC LOG: Append Observation-Thought-Action step to log.md (fine-grained trace)",
+  args: {
+    observation: tool.schema.string().optional().describe("What was observed"),
+    thought: tool.schema.string().optional().describe("What the agent thought"),
+    action: tool.schema.string().optional().describe("What action was taken"),
+    entry: tool.schema.string().optional().describe("Or just a freeform log entry"),
+  },
+  async execute(args) {
+    await ensureDir()
+    const branch = await getCurrentBranch()
+    const logFile = getLogFile(branch)
+    await Bun.$`mkdir -p ${getBranchDir(branch)}`
+
+    const timestamp = new Date().toISOString()
+    let logEntry = `\n[${timestamp}]\n`
+
+    if (args.entry) {
+      logEntry += args.entry
+    } else {
+      if (args.observation) logEntry += `Observation: ${args.observation}\n`
+      if (args.thought) logEntry += `Thought: ${args.thought}\n`
+      if (args.action) logEntry += `Action: ${args.action}\n`
+    }
+
+    const existing = (await logFile.exists()) ? await logFile.text() : ""
+    await Bun.write(logFile, existing + logEntry)
+
+    return `✓ Logged to branch '${branch}'`
+  },
+})
+
+// Original tools (adapted to work with GCC)
 const remember = tool({
-  description: "Store a memory (decision, learning, preference, blocker, context, pattern)",
+  description: "Store a memory (decision, learning, preference, blocker, context, pattern) - auto-logs to current branch",
   args: {
     type: tool.schema
       .enum(["decision", "learning", "preference", "blocker", "context", "pattern"])
@@ -74,284 +477,173 @@ const remember = tool({
   },
   async execute(args) {
     await ensureDir()
+    const branch = await getCurrentBranch()
 
-    const ts = new Date().toISOString()
-    const issue = args.issue ? ` issue=${args.issue}` : ""
-    const tags = args.tags?.length ? ` tags=${args.tags.join(",")}` : ""
-    const content = args.content.replace(/"/g, '\\"')
-    const line = `ts=${ts} type=${args.type} scope=${args.scope} content="${content}"${issue}${tags}\n`
+    // Log to branch log.md
+    const logEntry = `
+**Memory Added**: ${args.type} / ${args.scope}
+Content: ${args.content}
+${args.issue ? `Issue: ${args.issue}` : ""}
+${args.tags?.length ? `Tags: ${args.tags.join(", ")}` : ""}
+`
 
-    const file = getMemoryFile()
-    const existing = (await file.exists()) ? await file.text() : ""
-    await Bun.write(file, existing + line)
+    const logFile = getLogFile(branch)
+    await Bun.$`mkdir -p ${getBranchDir(branch)}`
+    const existing = (await logFile.exists()) ? await logFile.text() : ""
+    await Bun.write(logFile, existing + logEntry)
 
-    return `Remembered: ${args.type} in ${args.scope}`
+    return `Remembered: ${args.type} in ${args.scope} (logged to branch '${branch}')`
   },
 })
 
-const getAllMemories = async (): Promise<Memory[]> => {
-  const glob = new Bun.Glob("*.logfmt")
-  const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
-
-  if (!files.length) return []
-
-  const lines: string[] = []
-  for (const filename of files) {
-    if (filename === "deletions.logfmt") continue // skip audit log
-    const file = Bun.file(`${MEMORY_DIR}/${filename}`)
-    const text = await file.text()
-    lines.push(...text.trim().split("\n").filter(Boolean))
-  }
-
-  return lines.map(parseLine).filter((m): m is Memory => m !== null)
-}
-
-const logDeletion = async (memory: Memory, reason: string) => {
-  await ensureDir()
-  const ts = new Date().toISOString()
-  const content = memory.content.replace(/"/g, '\\"')
-  const originalTs = memory.ts
-  const issue = memory.issue ? ` issue=${memory.issue}` : ""
-  const tags = memory.tags?.length ? ` tags=${memory.tags.join(",")}` : ""
-  const escapedReason = reason.replace(/"/g, '\\"')
-  const line = `ts=${ts} action=deleted original_ts=${originalTs} type=${memory.type} scope=${memory.scope} content="${content}" reason="${escapedReason}"${issue}${tags}\n`
-
-  const file = Bun.file(`${MEMORY_DIR}/deletions.logfmt`)
-  const existing = (await file.exists()) ? await file.text() : ""
-  await Bun.write(file, existing + line)
-}
-
 const recall = tool({
-  description: "Retrieve memories by scope, type, or search query",
+  description: "Retrieve memories by searching logs and commits across branches",
   args: {
+    query: tool.schema.string().optional().describe("Search term"),
+    branch_name: tool.schema.string().optional().describe("Specific branch to search"),
     scope: tool.schema.string().optional().describe("Filter by scope"),
     type: tool.schema
       .enum(["decision", "learning", "preference", "blocker", "context", "pattern"])
       .optional()
       .describe("Filter by type"),
-    query: tool.schema.string().optional().describe("Search term (space-separated words, matches any)"),
-    limit: tool.schema.number().optional().describe("Max results (default 20)"),
   },
   async execute(args) {
-    let results = await getAllMemories()
+    await ensureDir()
+    const searchBranch = args.branch_name || (await getCurrentBranch())
 
-    if (!results.length) return "No memories found"
+    const logFile = getLogFile(searchBranch)
+    const commitFile = getCommitFile(searchBranch)
 
-    const totalCount = results.length
+    let results = ""
 
-    if (args.scope) {
-      results = results.filter((m) => m.scope === args.scope || m.scope.includes(args.scope!))
-    }
-    if (args.type) {
-      results = results.filter((m) => m.type === args.type)
-    }
+    if (await logFile.exists()) {
+      const log = await logFile.text()
+      const logLines = log.split("\n").filter(Boolean)
 
-    if (args.query) {
-      const words = args.query.toLowerCase().split(/\s+/).filter(Boolean)
-      const scored = results
-        .map((m) => ({ memory: m, score: scoreMatch(m, words) }))
-        .filter((x) => x.score > 0)
-        .sort((a, b) => b.score - a.score)
-      results = scored.map((x) => x.memory)
-    }
-
-    const filteredCount = results.length
-    const limit = args.limit || 20
-    const limited = results.slice(-limit)
-
-    if (!limited.length) return "No matching memories"
-
-    const header = filteredCount > limit
-      ? `Found ${filteredCount} memories (showing last ${limit} of ${totalCount} total)\n\n`
-      : filteredCount !== totalCount
-        ? `Found ${filteredCount} memories (${totalCount} total)\n\n`
-        : `Found ${filteredCount} memories\n\n`
-
-    return header + limited.map(formatMemory).join("\n")
-  },
-})
-
-const update = tool({
-  description: "Update an existing memory by scope and type (finds matching memory and updates its content)",
-  args: {
-    scope: tool.schema.string().describe("Scope of memory to update"),
-    type: tool.schema
-      .enum(["decision", "learning", "preference", "blocker", "context", "pattern"])
-      .describe("Type of memory"),
-    content: tool.schema.string().describe("The new content for the memory"),
-    query: tool.schema.string().optional().describe("Search term to find specific memory if multiple exist"),
-    issue: tool.schema.string().optional().describe("Update related GitHub issue (e.g., #51)"),
-    tags: tool.schema.array(tool.schema.string()).optional().describe("Update tags"),
-  },
-  async execute(args) {
-    const glob = new Bun.Glob("*.logfmt")
-    const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
-
-    if (!files.length) return "No memory files found"
-
-    // Find matching memories
-    const matches: { memory: Memory; filepath: string; lineIndex: number }[] = []
-
-    for (const filename of files) {
-      if (filename === "deletions.logfmt") continue
-      const filepath = `${MEMORY_DIR}/${filename}`
-      const file = Bun.file(filepath)
-      const text = await file.text()
-      const lines = text.split("\n")
-
-      lines.forEach((line, lineIndex) => {
-        const memory = parseLine(line)
-        if (!memory) return
-        if (memory.scope === args.scope && memory.type === args.type) {
-          matches.push({ memory, filepath, lineIndex })
-        }
-      })
-    }
-
-    if (matches.length === 0) {
-      return `No memories found for ${args.type} in ${args.scope}`
-    }
-
-    // If multiple matches and query provided, filter by query
-    let target: typeof matches[number] | undefined = matches[0]
-    if (matches.length > 1) {
+      let filtered = logLines
       if (args.query) {
-        const words = args.query.toLowerCase().split(/\s+/).filter(Boolean)
-        const scored = matches
-          .map((m) => ({ ...m, score: scoreMatch(m.memory, words) }))
-          .filter((x) => x.score > 0)
-          .sort((a, b) => b.score - a.score)
+        filtered = filtered.filter((line) => line.toLowerCase().includes(args.query!.toLowerCase()))
+      }
+      if (args.scope) {
+        filtered = filtered.filter((line) => line.includes(args.scope!))
+      }
+      if (args.type) {
+        filtered = filtered.filter((line) => line.includes(args.type!))
+      }
 
-        if (scored.length === 0) {
-          return `Found ${matches.length} memories for ${args.type}/${args.scope}, but none matched query "${args.query}". Use recall to see all matches.`
-        }
-        target = scored[0]
-      } else {
-        return `Found ${matches.length} memories for ${args.type}/${args.scope}. Provide a query to select which one to update, or use recall to see all matches.`
+      if (filtered.length) {
+        results += `## Log Results (${filtered.length} matches)\n${filtered.slice(-20).join("\n")}\n\n`
       }
     }
 
-    if (!target) {
-      return `No memories found for ${args.type} in ${args.scope}`
+    if (await commitFile.exists()) {
+      const commits = await commitFile.text()
+      if (args.query && commits.toLowerCase().includes(args.query.toLowerCase())) {
+        results += `## Commit Results\n${commits.slice(-1000)}\n`
+      }
     }
 
-    // Log the old version before updating
-    await logDeletion(target.memory, `Updated to: ${args.content}`)
-
-    // Update the memory
-    const file = Bun.file(target.filepath)
-    const text = await file.text()
-    const lines = text.split("\n")
-
-    const ts = new Date().toISOString()
-    const issue = args.issue !== undefined ? args.issue : target.memory.issue
-    const tags = args.tags !== undefined ? args.tags : target.memory.tags
-    const issueStr = issue ? ` issue=${issue}` : ""
-    const tagsStr = tags?.length ? ` tags=${tags.join(",")}` : ""
-    const content = args.content.replace(/"/g, '\\"')
-    const newLine = `ts=${ts} type=${args.type} scope=${args.scope} content="${content}"${issueStr}${tagsStr}`
-
-    lines[target.lineIndex] = newLine
-    await Bun.write(target.filepath, lines.join("\n"))
-
-    return `Updated ${args.type} in ${args.scope}: "${args.content}"`
+    return results || "No matching memories found"
   },
 })
 
-const listMemories = tool({
-  description: "List all unique scopes and types in memory for discovery",
-  args: {},
-  async execute() {
-    const memories = await getAllMemories()
-
-    if (!memories.length) return "No memories found"
-
-    const scopes = new Map<string, number>()
-    const types = new Map<string, number>()
-    const scopeTypes = new Map<string, Set<string>>()
-
-    for (const m of memories) {
-      scopes.set(m.scope, (scopes.get(m.scope) || 0) + 1)
-      types.set(m.type, (types.get(m.type) || 0) + 1)
-      if (!scopeTypes.has(m.scope)) scopeTypes.set(m.scope, new Set())
-      scopeTypes.get(m.scope)!.add(m.type)
-    }
-
-    const lines: string[] = []
-    lines.push(`Total memories: ${memories.length}`)
-    lines.push("")
-    lines.push("Scopes:")
-    for (const [scope, count] of [...scopes.entries()].sort((a, b) => b[1] - a[1])) {
-      const typeList = [...scopeTypes.get(scope)!].join(", ")
-      lines.push(`  ${scope}: ${count} (${typeList})`)
-    }
-    lines.push("")
-    lines.push("Types:")
-    for (const [type, count] of [...types.entries()].sort((a, b) => b[1] - a[1])) {
-      lines.push(`  ${type}: ${count}`)
-    }
-
-    return lines.join("\n")
-  },
-})
-
-const forget = tool({
-  description: "Delete a memory by scope and type (removes matching lines from all memory files, logs deletion for audit)",
+const switchBranch = tool({
+  description: "GCC: Switch to a different branch",
   args: {
-    scope: tool.schema.string().describe("Scope of memory to delete"),
-    type: tool.schema
-      .enum(["decision", "learning", "preference", "blocker", "context", "pattern"])
-      .describe("Type of memory"),
-    reason: tool.schema.string().describe("Why this is being deleted (for audit purposes)"),
+    branch: tool.schema.string().describe("Branch name to switch to"),
   },
   async execute(args) {
-    const glob = new Bun.Glob("*.logfmt")
-    const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
+    await ensureDir()
+    const branchDir = getBranchDir(args.branch)
+    const commitFile = getCommitFile(args.branch)
 
-    if (!files.length) return "No memory files found"
-
-    let deleted = 0
-    const deletedMemories: Memory[] = []
-
-    for (const filename of files) {
-      if (filename === "deletions.logfmt") continue // skip audit log
-      const filepath = `${MEMORY_DIR}/${filename}`
-      const file = Bun.file(filepath)
-      const text = await file.text()
-      const lines = text.split("\n")
-      const filtered = lines.filter((line) => {
-        const memory = parseLine(line)
-        if (!memory) return true
-        if (memory.scope === args.scope && memory.type === args.type) {
-          deleted++
-          deletedMemories.push(memory)
-          return false
-        }
-        return true
-      })
-      if (filtered.length !== lines.length) {
-        await Bun.write(filepath, filtered.join("\n"))
-      }
+    if (!(await commitFile.exists())) {
+      return `✗ Branch '${args.branch}' does not exist. Use memory_branch to create it.`
     }
 
-    // Log all deletions to audit file
-    for (const memory of deletedMemories) {
-      await logDeletion(memory, args.reason)
-    }
-
-    if (deleted === 0) return `No memories found for ${args.type} in ${args.scope}`
-    return `Deleted ${deleted} ${args.type} memory(s) from ${args.scope}. Reason: ${args.reason}\nDeletions logged to ${MEMORY_DIR}/deletions.logfmt`
+    await setCurrentBranch(args.branch)
+    return `✓ Switched to branch '${args.branch}'`
   },
 })
+
+// Helper function to generate GCC system prompt with current state
+const generateGccSystemPrompt = async (): Promise<string> => {
+  const currentBranch = await getCurrentBranch()
+  
+  let roadmapSummary = ""
+  const mainFile = getMainFile()
+  if (await mainFile.exists()) {
+    const content = await mainFile.text()
+    // Get first 500 chars of roadmap
+    roadmapSummary = content.slice(0, 500)
+    if (content.length > 500) roadmapSummary += "..."
+  }
+  
+  return GCC_SYSTEM_PROMPT
+    .replace("{{CURRENT_BRANCH}}", currentBranch)
+    .replace("{{#if ROADMAP_SUMMARY}}", roadmapSummary ? "" : "<!--")
+    .replace("{{/if}}", roadmapSummary ? "" : "-->")
+    .replace("{{ROADMAP_SUMMARY}}", roadmapSummary)
+}
 
 export const MemoryPlugin: Plugin = async (_ctx) => {
+  // Initialize main branch on first run
+  await ensureDir()
+  const currentBranch = await getCurrentBranch()
+  const mainBranchDir = getBranchDir("main")
+  await Bun.$`mkdir -p ${mainBranchDir}`
+
+  const mainCommitFile = getCommitFile("main")
+  if (!(await mainCommitFile.exists())) {
+    await Bun.write(
+      mainCommitFile,
+      `# Branch: main\n\n## Branch Purpose\nMain development branch\n\n## Previous Progress Summary\nInitialized at ${new Date().toISOString()}\n\n---\n`
+    )
+  }
+
+  const mainLogFile = getLogFile("main")
+  if (!(await mainLogFile.exists())) {
+    await Bun.write(mainLogFile, "")
+  }
+
+  // Initialize main.md if not exists
+  const mainFile = getMainFile()
+  if (!(await mainFile.exists())) {
+    await Bun.write(mainFile, "# Project Roadmap\n\nInitialized at " + new Date().toISOString() + "\n\n## Goals\n\n## Milestones\n\n")
+  }
+
   return {
     tool: {
+      // GCC Core Commands
+      memory_commit: commit,
+      memory_branch: branch,
+      memory_merge: merge,
+      memory_context: context,
+      memory_log: log,
+      memory_switch: switchBranch,
+
+      // Legacy commands (adapted to work with GCC)
       memory_remember: remember,
       memory_recall: recall,
-      memory_update: update,
-      memory_forget: forget,
-      memory_list: listMemories,
+    },
+    
+    // System prompt injection hook (Paper Section 2.2 requirement)
+    // Uses OpenCode's experimental.chat.system.transform hook
+    // Same pattern as opencode-agent-memory plugin (Letta-inspired)
+    "experimental.chat.system.transform": async (
+      _input: { sessionID?: string; model?: unknown },
+      output: { system: string[] }
+    ) => {
+      try {
+        const gccPrompt = await generateGccSystemPrompt()
+        // Insert GCC context after the first system message (position 1)
+        // This ensures it comes after provider header but early for salience
+        const insertAt = output.system.length > 0 ? 1 : 0
+        output.system.splice(insertAt, 0, gccPrompt)
+      } catch (e) {
+        // Silently fail if GCC not initialized yet
+        console.error("GCC system prompt injection failed:", e)
+      }
     },
   }
 }

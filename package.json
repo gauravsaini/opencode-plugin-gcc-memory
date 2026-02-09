@@ -1,9 +1,9 @@
 {
-  "name": "@knikolov/opencode-plugin-simple-memory",
+  "name": "@gauravsaini/opencode-plugin-gcc-memory",
   "module": "index.ts",
   "version": "1.0.2",
-  "author": "knikolov",
-  "repository": "https://github.com/cnicolov/opencode-plugin-simple-memory",
+  "author": "gauravsaini",
+  "repository": "https://github.com/gauravsaini/opencode-plugin-gcc-memory",
   "files": [
     "index.ts",
     "src"
